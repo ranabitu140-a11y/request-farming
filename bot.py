@@ -2,6 +2,7 @@ import os
 import random
 import string
 import logging
+import asyncio
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -214,6 +215,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/add_admin <id>` — Add admin (Owner)\n"
         "`/rem_admin <id>` — Remove admin (Owner)\n"
         "`/admins` — List admins (Owner)\n"
+        "`/broadcast` — Broadcast message (Reply to msg)\n"
         "`/help` — Show this message",
         parse_mode="Markdown"
     )
@@ -329,6 +331,59 @@ async def list_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"👤 `{a['user_id']}`\n"
         
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast a message to all users (Admins only)."""
+    if not await is_admin(update.effective_user.id):
+        return
+        
+    if not update.message.reply_to_message:
+        await update.message.reply_text("❌ Please reply to the message you want to broadcast.")
+        return
+        
+    msg_to_broadcast = update.message.reply_to_message
+    status_msg = await update.message.reply_text("🚀 Starting broadcast... This may take a while.")
+    
+    cursor = users_col.find({})
+    users = await cursor.to_list(length=None)
+    
+    total = len(users)
+    success = 0
+    failed = 0
+    deleted = 0
+    
+    for u in users:
+        user_id = u["user_id"]
+        try:
+            if msg_to_broadcast.forward_origin:
+                await context.bot.forward_message(
+                    chat_id=user_id,
+                    from_chat_id=update.message.chat_id,
+                    message_id=msg_to_broadcast.message_id
+                )
+            else:
+                await context.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=update.message.chat_id,
+                    message_id=msg_to_broadcast.message_id
+                )
+            success += 1
+        except Exception as e:
+            if "Forbidden" in str(e) or "bot was blocked" in str(e) or "user is deactivated" in str(e):
+                await users_col.delete_one({"user_id": user_id})
+                deleted += 1
+            failed += 1
+            
+        await asyncio.sleep(0.05)
+        
+    await status_msg.edit_text(
+        f"📢 **Broadcast Completed!**\n\n"
+        f"🎯 Total Users: {total}\n"
+        f"✅ Success: {success}\n"
+        f"❌ Failed: {failed}\n"
+        f"🗑️ Removed (Blocked Bot): {deleted}",
+        parse_mode="Markdown"
+    )
 
 async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all channels and provide remove buttons."""
@@ -577,6 +632,7 @@ def main():
     app.add_handler(CommandHandler("add_admin", add_admin_cmd))
     app.add_handler(CommandHandler("rem_admin", rem_admin_cmd))
     app.add_handler(CommandHandler("admins", list_admins_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & (filters.Document.ALL | filters.VIDEO | filters.PHOTO | filters.TEXT | filters.FORWARDED) & ~filters.COMMAND,

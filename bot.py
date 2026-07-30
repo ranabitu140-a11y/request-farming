@@ -4,6 +4,7 @@ import string
 import logging
 import asyncio
 from dotenv import load_dotenv
+from keep_alive import keep_alive
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -619,6 +620,7 @@ async def post_init(application: Application):
 
 def main():
     log.info("Starting bot...")
+    keep_alive()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 

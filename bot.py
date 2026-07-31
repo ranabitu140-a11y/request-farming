@@ -184,7 +184,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             sent_messages.append(warning_msg.message_id)
-            context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
+            if context.job_queue:
+                context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
+            else:
+                log.warning("No JobQueue available. Messages will not be auto-deleted.")
         
         return
 
@@ -574,7 +577,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     request = update.chat_join_request
     user_id = request.from_user.id
     channel_id = request.chat.id
-    # log.info(f"Join request from {user_id} for channel {channel_id}")
+    log.info(f"Join request from {user_id} for channel {channel_id}")
 
     # Record that the user has requested this channel
     await add_user_channel(user_id, channel_id)
@@ -614,7 +617,10 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode="Markdown"
             )
             sent_messages.append(warning_msg.message_id)
-            context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
+            if context.job_queue:
+                context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
+            else:
+                log.warning("No JobQueue available. Messages will not be auto-deleted.")
 
     # NOTE: We do NOT call request.approve(). The join request stays pending.
 

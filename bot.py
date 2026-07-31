@@ -490,6 +490,13 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     bot_token=BOT_TOKEN,
                     in_memory=True
                 ) as pyro_client:
+                    # Force resolve the channel peer to prevent PeerIdInvalid
+                    try:
+                        await pyro_client.get_chat(chat_id)
+                    except Exception:
+                        async for _ in pyro_client.get_dialogs():
+                            pass
+
                     msg_ids = list(range(first_msg, last_msg + 1))
                     all_msgs = []
                     for i in range(0, len(msg_ids), 200):

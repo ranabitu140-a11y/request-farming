@@ -530,7 +530,7 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bot_me = await context.bot.get_me()
                 deep_link = f"https://t.me/{bot_me.username}?start={payload}"
                 await status_msg.edit_text(
-                    f"✅ Batch created! ({len(file_ids)} files)\n\n🔗 *Link:* `{deep_link}`",
+                    f"✅ Batch created! ({len(file_ids)} files)\n\n🔗 *Link:* {deep_link}",
                     parse_mode="Markdown"
                 )
             except Exception as e:
@@ -560,7 +560,7 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = await save_file(file_id, file_type)
     bot_me = await context.bot.get_me()
     deep_link = f"https://t.me/{bot_me.username}?start={payload}"
-    await message.reply_text(f"✅ File saved!\n\n🔗 *Link:* `{deep_link}`", parse_mode="Markdown")
+    await message.reply_text(f"✅ File saved!\n\n🔗 *Link:* {deep_link}", parse_mode="Markdown")
 
 
 # ==========================================

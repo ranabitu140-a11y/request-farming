@@ -202,8 +202,18 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass  # No existing request to decline — that's fine
 
+    # Generate a FRESH invite link to bypass Telegram's client-side cache
+    try:
+        fresh_invite = await context.bot.create_chat_invite_link(
+            chat_id=selected["channel_id"],
+            creates_join_request=True
+        )
+        invite_url = fresh_invite.invite_link
+    except Exception:
+        invite_url = selected["invite_link"]  # Fallback to stored link
+
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel to Access", url=selected["invite_link"])]
+        [InlineKeyboardButton("📢 Join Channel to Access", url=invite_url)]
     ])
     msg = await update.message.reply_text(
         "🔐 To access this file, please send a *join request* to the BACKUP channel below.\n\n"

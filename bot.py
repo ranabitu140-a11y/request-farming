@@ -99,13 +99,13 @@ async def add_user_channel(user_id, channel_id):
     await users_col.update_one({"user_id": user_id}, {"$addToSet": {"requested_channels": channel_id}}, upsert=True)
 
 
-async def set_pending(user_id, payload, message_id):
-    await pending_col.update_one({"user_id": user_id}, {"$set": {"payload_string": payload, "message_id": message_id}}, upsert=True)
+async def set_pending(user_id, payload, message_id, channel_id=None):
+    await pending_col.update_one({"user_id": user_id}, {"$set": {"payload_string": payload, "message_id": message_id, "channel_id": channel_id}}, upsert=True)
 
 
 async def get_pending(user_id):
     doc = await pending_col.find_one({"user_id": user_id})
-    return (doc["payload_string"], doc.get("message_id")) if doc else (None, None)
+    return (doc["payload_string"], doc.get("message_id"), doc.get("channel_id")) if doc else (None, None, None)
 
 
 async def clear_pending(user_id):
@@ -196,16 +196,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Pick one channel completely at random from the remaining available pool
     selected = random.choice(available)
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel to Access", url=selected["invite_link"])]
+        [InlineKeyboardButton("📢 Join Channel to Access", url=selected["invite_link"])],
+        [InlineKeyboardButton("✅ Done - Get My File", callback_data=f"verify_{selected['channel_id']}")]
     ])
     msg = await update.message.reply_text(
         "🔐 To access this file, please send a *join request* to the BACKUP channel below.\n\n"
-        "⚠️ Just tap the button and send a join request — your file will arrive automatically!",
+        "⚠️ Tap the button, send a join request, then tap *✅ Done* to get your file!",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
-    await set_pending(user_id, payload, msg.message_id)
-    log.info(f"Set pending for {user_id}: {payload}")
+    await set_pending(user_id, payload, msg.message_id, selected["channel_id"])
+    log.info(f"Set pending for {user_id}: {payload} channel: {selected['channel_id']}")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,9 +418,85 @@ async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    data = query.data
+
+    if data.startswith("verify_"):
+        # ---- Verify Button: User claims they sent join request ----
+        user_id = query.from_user.id
+        channel_id_str = data.split("_", 1)[1]
+        try:
+            channel_id = int(channel_id_str)
+        except ValueError:
+            await query.answer("❌ Invalid channel.", show_alert=True)
+            return
+
+        # Check if user has a pending file
+        pending_payload, msg_id, pending_channel = await get_pending(user_id)
+        if not pending_payload:
+            await query.answer("❌ No pending file found. Use /start again.", show_alert=True)
+            return
+
+        # Verify the user actually has a pending join request or is a member
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            status = member.status
+            # "left" means they never interacted, "kicked" means banned
+            if status in ["left", "kicked"]:
+                await query.answer("⚠️ You haven't sent a join request yet! Tap the Join button first.", show_alert=True)
+                return
+        except Exception:
+            # If getChatMember fails, user likely has a pending request (API can't see pending)
+            # Trust them and deliver — this is the fallback for the exact stuck scenario
+            pass
+
+        await query.answer("✅ Verified! Sending your files...")
+
+        # Record that user has requested this channel
+        await add_user_channel(user_id, channel_id)
+
+        # Deliver files
+        files_list = await get_file(pending_payload)
+        sent_messages = []
+        if files_list:
+            for f in files_list:
+                try:
+                    if f["type"] == "document":
+                        s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"])
+                    elif f["type"] == "video":
+                        s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"])
+                    elif f["type"] == "photo":
+                        s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"])
+                    elif f["type"] == "text":
+                        s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"])
+                    sent_messages.append(s_msg.message_id)
+                except Exception as e:
+                    log.error(f"Verify send error: {e}")
+
+        await clear_pending(user_id)
+
+        # Delete the join request message
+        if msg_id:
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception:
+                pass
+
+        # Auto-delete timer
+        if sent_messages:
+            timer = await get_delete_timer()
+            warning_msg = await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ *Important:*\n\nAll Messages will be deleted after {timer} minutes. Please save or forward these messages to your personal saved messages to avoid losing them!",
+                parse_mode="Markdown"
+            )
+            sent_messages.append(warning_msg.message_id)
+            if context.job_queue:
+                context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
+
+        return
+
     await query.answer()
     
-    data = query.data
     if data.startswith("rem_"):
         channel_id_str = data.split("_")[1]
         try:
@@ -586,7 +663,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await add_user_channel(user_id, channel_id)
 
     # Check if there's a pending file delivery for this user
-    pending_payload, msg_id = await get_pending(user_id)
+    pending_payload, msg_id, pending_channel = await get_pending(user_id)
     log.info(f"Pending payload for {user_id}: {pending_payload}")
     
     if pending_payload:

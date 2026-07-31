@@ -155,10 +155,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Filter out any channel IDs that are already in the user's requested list.
     # This ensures the user is only ever asked to join channels they haven't requested yet.
     available = [c for c in all_channels if c["channel_id"] not in requested]
+    log.info(f"User {user_id} requested: {requested}, available: {[c['channel_id'] for c in available]}")
 
     # Edge Case Bypass: If the user has already requested ALL channels in the pool,
     # skip the force request completely and deliver files directly.
     if not available:
+        log.info(f"No available channels for {user_id}. Delivering directly.")
         msg = await update.message.reply_text("⏳ Sending your files...")
         sent_messages = []
         for f in files_list:
@@ -203,6 +205,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
     await set_pending(user_id, payload, msg.message_id)
+    log.info(f"Set pending for {user_id}: {payload}")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -584,8 +587,11 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Check if there's a pending file delivery for this user
     pending_payload, msg_id = await get_pending(user_id)
+    log.info(f"Pending payload for {user_id}: {pending_payload}")
+    
     if pending_payload:
         files_list = await get_file(pending_payload)
+        log.info(f"Files found in DB: {len(files_list) if files_list else 0}")
         sent_messages = []
         if files_list:
             for f in files_list:

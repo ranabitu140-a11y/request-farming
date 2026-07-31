@@ -196,7 +196,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Pick one channel completely at random from the remaining available pool
     selected = random.choice(available)
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel to Access", url=selected["invite_link"])]
+        [InlineKeyboardButton("📢 Join Channel to Access", url=selected["invite_link"])],
+        [InlineKeyboardButton("🔄 Stuck? Try Another Channel", callback_data=f"swap_{selected['channel_id']}")]
     ])
     msg = await update.message.reply_text(
         "🔐 To access this file, please send a *join request* to the BACKUP channel below.\n\n"
@@ -441,6 +442,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=query.from_user.id, text=f"✅ Removed channel {channel_id} from the pool.")
         except Exception as e:
             await context.bot.send_message(chat_id=query.from_user.id, text=f"❌ Error removing channel: {e}")
+
+    elif data.startswith("swap_"):
+        old_channel_id = int(data.split("_")[1])
+        user_id = query.from_user.id
+        
+        all_channels = await get_all_channels()
+        requested = await get_user_channels(user_id)
+        
+        # Filter out requested and the one they are currently stuck on
+        available = [c for c in all_channels if c["channel_id"] not in requested and c["channel_id"] != old_channel_id]
+        
+        if not available:
+            await context.bot.send_message(chat_id=user_id, text="❌ No other channels are available right now.")
+            return
+            
+        selected = random.choice(available)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Join Channel to Access", url=selected["invite_link"])],
+            [InlineKeyboardButton("🔄 Stuck? Try Another Channel", callback_data=f"swap_{selected['channel_id']}")]
+        ])
+        await query.edit_message_reply_markup(reply_markup=keyboard)
 
 
 async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):

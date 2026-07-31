@@ -135,7 +135,7 @@ async def delete_messages_job(context: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command and deep links."""
     user_id = update.effective_user.id
-    log.info(f"/start from {user_id}")
+    # log.info(f"/start from {user_id}")
 
     if not context.args:
         await update.message.reply_text("🔥 I am file store bot")
@@ -565,7 +565,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     request = update.chat_join_request
     user_id = request.from_user.id
     channel_id = request.chat.id
-    log.info(f"Join request from {user_id} for channel {channel_id}")
+    # log.info(f"Join request from {user_id} for channel {channel_id}")
 
     # Record that the user has requested this channel
     await add_user_channel(user_id, channel_id)

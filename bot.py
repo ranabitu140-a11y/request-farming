@@ -193,14 +193,70 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         return
 
-    # Pick one channel completely at random from the remaining available pool
-    selected = random.choice(available)
+    # Check if user is already a member of the selected channel, or clear stale requests
+    while available:
+        selected = random.choice(available)
+        channel_id = selected["channel_id"]
+        
+        # Check if user is already a participant or banned
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            if member.status in ['member', 'creator', 'administrator', 'kicked']:
+                log.info(f"User {user_id} already in {channel_id} (or banned). Skipping.")
+                await add_user_channel(user_id, channel_id)
+                available.remove(selected)
+                continue
+        except Exception as e:
+            # If "User not found" or "User not participant", they are not in the chat.
+            pass
 
-    # Decline any stale/old pending join request so Telegram fires a fresh event
-    try:
-        await context.bot.decline_chat_join_request(chat_id=selected["channel_id"], user_id=user_id)
-    except Exception:
-        pass  # No existing request to decline — that's fine
+        # Decline any stale/old pending join request so Telegram fires a fresh event
+        try:
+            await context.bot.decline_chat_join_request(chat_id=channel_id, user_id=user_id)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "already a participant" in err_str:
+                await add_user_channel(user_id, channel_id)
+                available.remove(selected)
+                continue
+
+        # Found a valid channel
+        break
+
+    # If all channels were skipped because user is already in them
+    if not available:
+        log.info(f"No available channels for {user_id} after checking membership. Delivering directly.")
+        msg = await update.message.reply_text("⏳ Sending your files...")
+        sent_messages = []
+        for f in files_list:
+            try:
+                if f["type"] == "document":
+                    s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"])
+                elif f["type"] == "video":
+                    s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"])
+                elif f["type"] == "photo":
+                    s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"])
+                elif f["type"] == "text":
+                    s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"])
+                sent_messages.append(s_msg.message_id)
+            except Exception as e:
+                log.error(f"Send error: {e}")
+        await msg.delete()
+        
+        if sent_messages:
+            timer = await get_delete_timer()
+            warning_msg = await context.bot.send_message(
+                chat_id=user_id, 
+                text=f"⚠️ *Important:*\n\nAll Messages will be deleted after {timer} minutes. Please save or forward these messages to your personal saved messages to avoid losing them!",
+                parse_mode="Markdown"
+            )
+            sent_messages.append(warning_msg.message_id)
+            if context.job_queue:
+                context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
+            else:
+                log.warning("No JobQueue available. Messages will not be auto-deleted.")
+        
+        return
 
     # Generate a FRESH invite link to bypass Telegram's client-side cache
     try:

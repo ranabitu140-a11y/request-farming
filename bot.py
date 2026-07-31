@@ -492,10 +492,12 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ) as pyro_client:
                     # Force resolve the channel peer to prevent PeerIdInvalid
                     try:
-                        await pyro_client.get_chat(chat_id)
-                    except Exception:
-                        async for _ in pyro_client.get_dialogs():
-                            pass
+                        from pyrogram.raw.functions.channels import GetChannels
+                        from pyrogram.raw.types import InputChannel
+                        channel_id_raw = abs(chat_id) - 1000000000000
+                        await pyro_client.invoke(GetChannels(id=[InputChannel(channel_id=channel_id_raw, access_hash=0)]))
+                    except Exception as e:
+                        log.error(f"Failed to resolve channel peer: {e}")
 
                     msg_ids = list(range(first_msg, last_msg + 1))
                     all_msgs = []

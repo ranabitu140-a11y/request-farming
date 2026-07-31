@@ -27,6 +27,10 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+# Silence spammy HTTP request logs from python-telegram-bot
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
 log = logging.getLogger(__name__)
 
 # ==========================================

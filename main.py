@@ -11,6 +11,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ChatJoinRequestHandler, ContextTypes, filters, CallbackQueryHandler
 )
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -36,7 +37,7 @@ log = logging.getLogger(__name__)
 # ==========================================
 # DATABASE (Motor - Async MongoDB)
 # ==========================================
-mongo_client = AsyncIOMotorClient(MONGO_URI)
+mongo_client = AsyncIOMotorClient(MONGO_URI, maxPoolSize=500)
 db = mongo_client[DB_NAME]
 channels_pool = db["channels_pool"]
 files_col = db["files"]
@@ -708,6 +709,16 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 # ==========================================
 async def post_init(application: Application):
     """Run after the bot starts."""
+    log.info("Creating database indexes for maximum performance...")
+    try:
+        await files_col.create_index("payload_string", unique=True)
+        await users_col.create_index("user_id", unique=True)
+        await pending_col.create_index("user_id", unique=True)
+        await channels_pool.create_index("channel_id", unique=True)
+        await admins_col.create_index("user_id", unique=True)
+    except Exception as e:
+        log.error(f"Error creating indexes: {e}")
+
     if OWNER_ID != 0:
         await add_admin(OWNER_ID)
         log.info(f"Owner initialized: {OWNER_ID}")
@@ -719,7 +730,8 @@ def main():
     log.info("Starting bot...")
     keep_alive()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    req = HTTPXRequest(connection_pool_size=500, read_timeout=30.0)
+    app = Application.builder().token(BOT_TOKEN).request(req).post_init(post_init).build()
 
     # Register handlers
     app.add_handler(CommandHandler("start", start_cmd))

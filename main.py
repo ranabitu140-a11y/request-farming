@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 # ==========================================
 # DATABASE (Motor - Async MongoDB)
 # ==========================================
-mongo_client = AsyncIOMotorClient(MONGO_URI, maxPoolSize=500)
+mongo_client = AsyncIOMotorClient(MONGO_URI, maxPoolSize=100)
 db = mongo_client[DB_NAME]
 channels_pool = db["channels_pool"]
 files_col = db["files"]

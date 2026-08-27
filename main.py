@@ -53,6 +53,13 @@ async def get_delete_timer():
 async def set_delete_timer(minutes: int):
     await settings_col.update_one({"_id": "config"}, {"$set": {"delete_timer": minutes}}, upsert=True)
 
+async def get_protect_content():
+    doc = await settings_col.find_one({"_id": "config"})
+    return doc.get("protect_content", True) if doc else True
+
+async def set_protect_content(status: bool):
+    await settings_col.update_one({"_id": "config"}, {"$set": {"protect_content": status}}, upsert=True)
+
 
 def generate_payload(length=32):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -164,16 +171,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info(f"No available channels for {user_id}. Delivering directly.")
         msg = await update.message.reply_text("⏳ Sending your files...")
         sent_messages = []
+        protect_status = await get_protect_content()
         for f in files_list:
             try:
                 if f["type"] == "document":
-                    s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"])
+                    s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
                 elif f["type"] == "video":
-                    s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"])
+                    s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
                 elif f["type"] == "photo":
-                    s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"])
+                    s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
                 elif f["type"] == "text":
-                    s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"])
+                    s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
                 sent_messages.append(s_msg.message_id)
             except Exception as e:
                 log.error(f"Send error: {e}")
@@ -229,16 +237,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info(f"No available channels for {user_id} after checking membership. Delivering directly.")
         msg = await update.message.reply_text("⏳ Sending your files...")
         sent_messages = []
+        protect_status = await get_protect_content()
         for f in files_list:
             try:
                 if f["type"] == "document":
-                    s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"])
+                    s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
                 elif f["type"] == "video":
-                    s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"])
+                    s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
                 elif f["type"] == "photo":
-                    s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"])
+                    s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
                 elif f["type"] == "text":
-                    s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"])
+                    s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
                 sent_messages.append(s_msg.message_id)
             except Exception as e:
                 log.error(f"Send error: {e}")
@@ -296,6 +305,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/add_channel <channel_id>` — Add a force-join channel\n"
         "`/channels` — List and remove channels\n"
         "`/set_timer <minutes>` — Set the auto-delete timer\n"
+        "`/protect on/off` — Toggle forward protection\n"
         "`/add_admin <id>` — Add admin (Owner)\n"
         "`/rem_admin <id>` — Remove admin (Owner)\n"
         "`/admins` — List admins (Owner)\n"
@@ -361,6 +371,28 @@ async def set_timer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Auto-delete timer set to {minutes} minutes.")
     except ValueError:
         await update.message.reply_text("❌ Please provide a valid number of minutes.")
+
+
+async def protect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle forward protection."""
+    if not await is_admin(update.effective_user.id):
+        return
+        
+    if not context.args:
+        current = await get_protect_content()
+        status = "ON" if current else "OFF"
+        await update.message.reply_text(f"Current Forward Protection is {status}.\nUsage: `/protect on` or `/protect off`", parse_mode="Markdown")
+        return
+        
+    arg = context.args[0].lower()
+    if arg == "on":
+        await set_protect_content(True)
+        await update.message.reply_text("✅ Forward Protection is now ON. Users cannot forward or save the delivered files.")
+    elif arg == "off":
+        await set_protect_content(False)
+        await update.message.reply_text("✅ Forward Protection is now OFF. Users can forward and save the delivered files.")
+    else:
+        await update.message.reply_text("❌ Invalid argument. Use `on` or `off`.")
 
 
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -667,16 +699,17 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         log.info(f"Files found in DB: {len(files_list) if files_list else 0}")
         sent_messages = []
         if files_list:
+            protect_status = await get_protect_content()
             for f in files_list:
                 try:
                     if f["type"] == "document":
-                        s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"])
+                        s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
                     elif f["type"] == "video":
-                        s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"])
+                        s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
                     elif f["type"] == "photo":
-                        s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"])
+                        s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
                     elif f["type"] == "text":
-                        s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"])
+                        s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
                     sent_messages.append(s_msg.message_id)
                 except Exception as e:
                     log.error(f"Failed to send to {user_id}: {e}")
@@ -740,6 +773,7 @@ def main():
     app.add_handler(CommandHandler("add_channel", add_channel_cmd))
     app.add_handler(CommandHandler("channels", channels_cmd))
     app.add_handler(CommandHandler("set_timer", set_timer_cmd))
+    app.add_handler(CommandHandler("protect", protect_cmd))
     app.add_handler(CommandHandler("add_admin", add_admin_cmd))
     app.add_handler(CommandHandler("rem_admin", rem_admin_cmd))
     app.add_handler(CommandHandler("admins", list_admins_cmd))

@@ -45,6 +45,9 @@ users_col = db["users"]
 pending_col = db["pending_requests"]
 admins_col = db["admins"]
 settings_col = db["settings"]
+source_channels_col = db["source_channels"]
+db_channels_col = db["db_channels"]
+captions_col = db["captions"]
 
 async def get_delete_timer():
     doc = await settings_col.find_one({"_id": "config"})
@@ -310,6 +313,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/rem_admin <id>` — Remove admin (Owner)\n"
         "`/admins` — List admins (Owner)\n"
         "`/broadcast` — Broadcast message (Reply to msg)\n"
+        "`/add_source <id>` — Add image source channel\n"
+        "`/rem_source <id>` — Remove image source channel\n"
+        "`/list_sources` — List source channels\n"
+        "`/add_db <id>` — Add DB processing channel\n"
+        "`/rem_db <id>` — Remove DB processing channel\n"
+        "`/list_db` — List DB channels\n"
+        "`/add_caption <text>` — Add custom caption\n"
+        "`/rem_caption <id>` — Remove custom caption\n"
+        "`/list_captions` — List all custom captions\n"
+        "`/run <src_id> <start_id> [end_id]` — Process videos\n"
         "`/help` — Show this message",
         parse_mode="Markdown"
     )
@@ -448,6 +461,65 @@ async def list_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def _run_broadcast_background(bot, chat_id, msg_to_broadcast, users, status_msg):
+    total = len(users)
+    success = 0
+    failed = 0
+    deleted = 0
+    
+    for i, u in enumerate(users):
+        user_id = u["user_id"]
+        try:
+            if msg_to_broadcast.forward_origin:
+                await bot.forward_message(
+                    chat_id=user_id,
+                    from_chat_id=chat_id,
+                    message_id=msg_to_broadcast.message_id
+                )
+            else:
+                await bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=chat_id,
+                    message_id=msg_to_broadcast.message_id
+                )
+            success += 1
+        except Exception as e:
+            if "Forbidden" in str(e) or "bot was blocked" in str(e) or "user is deactivated" in str(e):
+                await users_col.delete_one({"user_id": user_id})
+                deleted += 1
+            failed += 1
+            
+        # Update progress every 20 users
+        if (i + 1) % 20 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"🚀 **Broadcast In Progress...**\n\n"
+                    f"🎯 Total Users: {total}\n"
+                    f"⏳ Processed: {i + 1}\n"
+                    f"⏳ Remaining: {total - (i + 1)}\n"
+                    f"✅ Success: {success}\n"
+                    f"❌ Failed: {failed}\n"
+                    f"🗑️ Removed (Blocked): {deleted}",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass  # Ignore rate limits or identical text errors
+                
+        await asyncio.sleep(0.05)
+        
+    try:
+        await status_msg.edit_text(
+            f"📢 **Broadcast Completed!**\n\n"
+            f"🎯 Total Users: {total}\n"
+            f"✅ Success: {success}\n"
+            f"❌ Failed: {failed}\n"
+            f"🗑️ Removed (Blocked Bot): {deleted}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast a message to all users (Admins only)."""
     if not await is_admin(update.effective_user.id):
@@ -463,43 +535,14 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor = users_col.find({})
     users = await cursor.to_list(length=None)
     
-    total = len(users)
-    success = 0
-    failed = 0
-    deleted = 0
-    
-    for u in users:
-        user_id = u["user_id"]
-        try:
-            if msg_to_broadcast.forward_origin:
-                await context.bot.forward_message(
-                    chat_id=user_id,
-                    from_chat_id=update.message.chat_id,
-                    message_id=msg_to_broadcast.message_id
-                )
-            else:
-                await context.bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=update.message.chat_id,
-                    message_id=msg_to_broadcast.message_id
-                )
-            success += 1
-        except Exception as e:
-            if "Forbidden" in str(e) or "bot was blocked" in str(e) or "user is deactivated" in str(e):
-                await users_col.delete_one({"user_id": user_id})
-                deleted += 1
-            failed += 1
-            
-        await asyncio.sleep(0.05)
-        
-    await status_msg.edit_text(
-        f"📢 **Broadcast Completed!**\n\n"
-        f"🎯 Total Users: {total}\n"
-        f"✅ Success: {success}\n"
-        f"❌ Failed: {failed}\n"
-        f"🗑️ Removed (Blocked Bot): {deleted}",
-        parse_mode="Markdown"
-    )
+    # Run the actual broadcast in the background so it doesn't block the bot for other users
+    asyncio.create_task(_run_broadcast_background(
+        bot=context.bot,
+        chat_id=update.message.chat_id,
+        msg_to_broadcast=msg_to_broadcast,
+        users=users,
+        status_msg=status_msg
+    ))
 
 async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all channels and provide remove buttons."""
@@ -737,6 +780,273 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     # NOTE: We do NOT call request.approve(). The join request stays pending.
 
 
+async def add_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a source channel for image/video extraction."""
+    if not await is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/add_source <channel_id>`", parse_mode="Markdown")
+        return
+    try:
+        channel_id = int(context.args[0])
+        await source_channels_col.update_one({"channel_id": channel_id}, {"$set": {"channel_id": channel_id}}, upsert=True)
+        await update.message.reply_text(f"✅ Source channel `{channel_id}` added.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID.")
+
+async def rem_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a source channel."""
+    if not await is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/rem_source <channel_id>`", parse_mode="Markdown")
+        return
+    try:
+        channel_id = int(context.args[0])
+        await source_channels_col.delete_one({"channel_id": channel_id})
+        await update.message.reply_text(f"✅ Source channel `{channel_id}` removed.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID.")
+
+async def list_sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all source channels."""
+    if not await is_admin(update.effective_user.id): return
+    channels = await source_channels_col.find({}).to_list(length=None)
+    if not channels:
+        await update.message.reply_text("📭 No source channels.")
+        return
+    msg = "📋 **Source Channels:**\n\n"
+    for c in channels:
+        msg += f"🔹 `{c['channel_id']}`\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def add_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a DB processing channel."""
+    if not await is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/add_db <channel_id>`", parse_mode="Markdown")
+        return
+    try:
+        channel_id = int(context.args[0])
+        await db_channels_col.update_one({"channel_id": channel_id}, {"$set": {"channel_id": channel_id}}, upsert=True)
+        await update.message.reply_text(f"✅ DB Processing channel `{channel_id}` added.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID.")
+
+async def rem_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a DB processing channel."""
+    if not await is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/rem_db <channel_id>`", parse_mode="Markdown")
+        return
+    try:
+        channel_id = int(context.args[0])
+        await db_channels_col.delete_one({"channel_id": channel_id})
+        await update.message.reply_text(f"✅ DB Processing channel `{channel_id}` removed.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID.")
+
+async def list_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all DB processing channels."""
+    if not await is_admin(update.effective_user.id): return
+    channels = await db_channels_col.find({}).to_list(length=None)
+    if not channels:
+        await update.message.reply_text("📭 No DB channels.")
+        return
+    msg = "📋 **DB Processing Channels:**\n\n"
+    for c in channels:
+        msg += f"🔹 `{c['channel_id']}`\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def add_caption_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/add_caption <your caption text>`", parse_mode="Markdown")
+        return
+    text = " ".join(context.args)
+    cid = generate_payload(6)
+    await captions_col.insert_one({"_id": cid, "text": text})
+    await update.message.reply_text(f"✅ Caption added with ID: `{cid}`\n\nPreview:\n{text}", parse_mode="Markdown")
+
+async def rem_caption_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/rem_caption <id>`", parse_mode="Markdown")
+        return
+    cid = context.args[0]
+    res = await captions_col.delete_one({"_id": cid})
+    if res.deleted_count > 0:
+        await update.message.reply_text(f"✅ Caption `{cid}` removed.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Caption not found.", parse_mode="Markdown")
+
+async def list_captions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    captions = await captions_col.find({}).to_list(length=None)
+    if not captions:
+        await update.message.reply_text("📭 No custom captions. Default is used.")
+        return
+    msg = "📋 **Custom Captions:**\n\n"
+    for c in captions:
+        msg += f"🔹 **ID:** `{c['_id']}`\n**Text:** {c['text']}\n\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Extract thumbnails from source channel and post to DB channels."""
+    if not await is_admin(update.effective_user.id): return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: `/run <source_channel_id> <start_msg_id> [end_msg_id]`", parse_mode="Markdown")
+        return
+        
+    try:
+        source_channel_id = int(context.args[0])
+        start_msg_id = int(context.args[1])
+        end_msg_id = int(context.args[2]) if len(context.args) > 2 else start_msg_id
+    except ValueError:
+        await update.message.reply_text("❌ Channel ID and Message IDs must be integers.")
+        return
+
+    # Warn if source channel is not in db
+    src_doc = await source_channels_col.find_one({"channel_id": source_channel_id})
+    if not src_doc:
+        await update.message.reply_text("⚠️ Warning: Source channel not found in /list_sources, but continuing...")
+
+    db_docs = await db_channels_col.find({}).to_list(length=None)
+    if not db_docs:
+        await update.message.reply_text("❌ No DB Processing channels set! Add with /add_db")
+        return
+    db_channels = [d["channel_id"] for d in db_docs]
+
+    status_msg = await update.message.reply_text("⏳ Initializing Pyrogram to fetch messages...")
+
+    try:
+        from pyrogram import Client as PyroClient
+        API_ID = int(os.environ.get("API_ID", "0"))
+        API_HASH = os.environ.get("API_HASH", "")
+
+        async with PyroClient(
+            "run_fetcher",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN,
+            in_memory=True
+        ) as pyro_client:
+            try:
+                from pyrogram.raw.functions.channels import GetChannels
+                from pyrogram.raw.types import InputChannel
+                channel_id_raw = abs(source_channel_id) - 1000000000000
+                await pyro_client.invoke(GetChannels(id=[InputChannel(channel_id=channel_id_raw, access_hash=0)]))
+            except Exception as e:
+                log.error(f"Failed to resolve source channel peer: {e}")
+
+            start, end = min(start_msg_id, end_msg_id), max(start_msg_id, end_msg_id)
+            msg_ids = list(range(start, end + 1))
+            processed_count = 0
+            
+            for i in range(0, len(msg_ids), 200):
+                chunk = msg_ids[i:i + 200]
+                msgs = await pyro_client.get_messages(source_channel_id, chunk)
+                if not isinstance(msgs, list):
+                    msgs = [msgs]
+                    
+                bot_me = await context.bot.get_me()
+                
+                for msg in msgs:
+                    if msg.empty or not msg.video:
+                        continue
+                        
+                    # Save video for sharing
+                    payload = await save_file(msg.video.file_id, "video")
+                    deep_link = f"https://t.me/{bot_me.username}?start={payload}"
+                    
+                    # Get Thumbnail without downloading the full video
+                    thumb_bytes = None
+                    if msg.video.thumbs:
+                        try:
+                            # Fetch only the small thumbnail bytes
+                            thumb_io = await pyro_client.download_media(msg.video.thumbs[0].file_id, in_memory=True)
+                            if thumb_io:
+                                thumb_bytes = thumb_io.getvalue()
+                        except Exception as e:
+                            log.error(f"Error downloading thumbnail: {e}")
+                    
+                    orig_caption = msg.caption or ''
+                    captions = await captions_col.find({}).to_list(length=None)
+                    if captions:
+                        chosen_text = random.choice(captions)["text"]
+                    else:
+                        chosen_text = "🎥 **Vip Stuff 🥵🥵🔞**"
+                        
+                    caption = f"{chosen_text}\n\n🔗 [Click here to Watch/Download]({deep_link})\n\n{orig_caption}"
+                    
+                    # Post to DB processing channels
+                    for db_id in db_channels:
+                        try:
+                            if thumb_bytes:
+                                await context.bot.send_photo(chat_id=db_id, photo=thumb_bytes, caption=caption, parse_mode="Markdown")
+                            else:
+                                await context.bot.send_message(chat_id=db_id, text=f"No thumbnail available.\n\n{caption}", parse_mode="Markdown")
+                        except Exception as e:
+                            log.error(f"Failed to send poster to db channel {db_id}: {e}")
+                            
+                    processed_count += 1
+                    
+            await status_msg.edit_text(f"✅ Run completed! Processed {processed_count} videos.")
+            
+    except Exception as e:
+        log.error(f"/run error: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Error during run: {e}")
+
+async def live_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new videos posted live to source channels."""
+    msg = update.channel_post
+    if not msg or not msg.video:
+        return
+        
+    channel_id = update.effective_chat.id
+    
+    # Check if channel is a source channel
+    src = await source_channels_col.find_one({"channel_id": channel_id})
+    if not src:
+        return
+        
+    db_docs = await db_channels_col.find({}).to_list(length=None)
+    if not db_docs:
+        return
+    db_channels = [d["channel_id"] for d in db_docs]
+    
+    bot_me = await context.bot.get_me()
+    payload = await save_file(msg.video.file_id, "video")
+    deep_link = f"https://t.me/{bot_me.username}?start={payload}"
+    
+    thumb_bytes = None
+    if msg.video.thumbnail:
+        try:
+            # We can download it using PTB! Because this is live, the bot sees the message.
+            thumb_file = await context.bot.get_file(msg.video.thumbnail.file_id)
+            tb = await thumb_file.download_as_bytearray()
+            thumb_bytes = bytes(tb)
+        except Exception as e:
+            log.error(f"Error downloading live thumbnail: {e}")
+            
+    # get caption
+    captions = await captions_col.find({}).to_list(length=None)
+    if captions:
+        chosen_text = random.choice(captions)["text"]
+    else:
+        chosen_text = "🎥 **Vip Stuff 🥵🥵🔞**"
+        
+    orig_caption = msg.caption or ''
+    caption = f"{chosen_text}\n\n🔗 [Click here to Watch/Download]({deep_link})\n\n{orig_caption}"
+        
+    for db_id in db_channels:
+        try:
+            if thumb_bytes:
+                await context.bot.send_photo(chat_id=db_id, photo=thumb_bytes, caption=caption, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(chat_id=db_id, text=f"No thumbnail available.\n\n{caption}", parse_mode="Markdown")
+        except Exception as e:
+            log.error(f"Live broadcast send error to {db_id}: {e}")
+
 # ==========================================
 # MAIN
 # ==========================================
@@ -749,6 +1059,8 @@ async def post_init(application: Application):
         await pending_col.create_index("user_id", unique=True)
         await channels_pool.create_index("channel_id", unique=True)
         await admins_col.create_index("user_id", unique=True)
+        await source_channels_col.create_index("channel_id", unique=True)
+        await db_channels_col.create_index("channel_id", unique=True)
     except Exception as e:
         log.error(f"Error creating indexes: {e}")
 
@@ -778,7 +1090,24 @@ def main():
     app.add_handler(CommandHandler("rem_admin", rem_admin_cmd))
     app.add_handler(CommandHandler("admins", list_admins_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("add_source", add_source_cmd))
+    app.add_handler(CommandHandler("rem_source", rem_source_cmd))
+    app.add_handler(CommandHandler("list_sources", list_sources_cmd))
+    app.add_handler(CommandHandler("add_db", add_db_cmd))
+    app.add_handler(CommandHandler("rem_db", rem_db_cmd))
+    app.add_handler(CommandHandler("list_db", list_db_cmd))
+    app.add_handler(CommandHandler("add_caption", add_caption_cmd))
+    app.add_handler(CommandHandler("rem_caption", rem_caption_cmd))
+    app.add_handler(CommandHandler("list_captions", list_captions_cmd))
+    app.add_handler(CommandHandler("run", run_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Live channel handler for auto processing
+    app.add_handler(MessageHandler(
+        filters.ChatType.CHANNEL & filters.VIDEO,
+        live_channel_handler
+    ))
+    
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & (filters.Document.ALL | filters.VIDEO | filters.PHOTO | filters.TEXT | filters.FORWARDED) & ~filters.COMMAND,
         handle_upload

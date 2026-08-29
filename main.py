@@ -139,6 +139,43 @@ async def delete_messages_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             pass # Ignore if message was already deleted or chat not found
 
+async def _deliver_files_background(bot, job_queue, user_id, files_list, protect_status, msg_id_to_delete=None):
+    if msg_id_to_delete:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=msg_id_to_delete)
+        except Exception:
+            pass
+
+    sent_messages = []
+    for f in files_list:
+        try:
+            s_msg = None
+            if f["type"] == "document":
+                s_msg = await bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
+            elif f["type"] == "video":
+                s_msg = await bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
+            elif f["type"] == "photo":
+                s_msg = await bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
+            elif f["type"] == "text":
+                s_msg = await bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
+            if s_msg:
+                sent_messages.append(s_msg.message_id)
+        except Exception as e:
+            log.error(f"Send error in background: {e}")
+            
+    if sent_messages:
+        timer = await get_delete_timer()
+        warning_msg = await bot.send_message(
+            chat_id=user_id, 
+            text=f"⚠️ *Important:*\n\nAll Messages will be deleted after {timer} minutes. Please save or forward these messages to your personal saved messages to avoid losing them!",
+            parse_mode="Markdown"
+        )
+        sent_messages.append(warning_msg.message_id)
+        if job_queue:
+            job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
+        else:
+            log.warning("No JobQueue available. Messages will not be auto-deleted.")
+
 # ==========================================
 # HANDLERS
 # ==========================================
@@ -172,114 +209,60 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # skip the force request completely and deliver files directly.
     if not available:
         log.info(f"No available channels for {user_id}. Delivering directly.")
-        msg = await update.message.reply_text("⏳ Sending your files...")
-        sent_messages = []
         protect_status = await get_protect_content()
-        for f in files_list:
-            try:
-                if f["type"] == "document":
-                    s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
-                elif f["type"] == "video":
-                    s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
-                elif f["type"] == "photo":
-                    s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
-                elif f["type"] == "text":
-                    s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
-                sent_messages.append(s_msg.message_id)
-            except Exception as e:
-                log.error(f"Send error: {e}")
-        await msg.delete()
-        
-        if sent_messages:
-            timer = await get_delete_timer()
-            warning_msg = await context.bot.send_message(
-                chat_id=user_id, 
-                text=f"⚠️ *Important:*\n\nAll Messages will be deleted after {timer} minutes. Please save or forward these messages to your personal saved messages to avoid losing them!",
-                parse_mode="Markdown"
-            )
-            sent_messages.append(warning_msg.message_id)
-            if context.job_queue:
-                context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
-            else:
-                log.warning("No JobQueue available. Messages will not be auto-deleted.")
-        
+        asyncio.create_task(_deliver_files_background(context.bot, context.job_queue, user_id, files_list, protect_status))
         return
 
-    # Check if user is already a member of the selected channel, or clear stale requests
-    while available:
-        selected = random.choice(available)
-        channel_id = selected["channel_id"]
-        
-        # Check if user is already a participant or banned
+    # Check membership concurrently to avoid sequential delays
+    async def check_membership(selected_channel):
+        channel_id = selected_channel["channel_id"]
         try:
             member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
             if member.status in ['member', 'creator', 'administrator', 'kicked']:
-                log.info(f"User {user_id} already in {channel_id} (or banned). Skipping.")
-                await add_user_channel(user_id, channel_id)
-                available.remove(selected)
-                continue
-        except Exception as e:
-            # If "User not found" or "User not participant", they are not in the chat.
+                return selected_channel, True
+        except Exception:
             pass
+        return selected_channel, False
 
-        # Decline any stale/old pending join request so Telegram fires a fresh event
-        try:
-            await context.bot.decline_chat_join_request(chat_id=channel_id, user_id=user_id)
-        except Exception as e:
-            err_str = str(e).lower()
-            if "already a participant" in err_str:
-                await add_user_channel(user_id, channel_id)
-                available.remove(selected)
-                continue
-
-        # Found a valid channel
-        break
+    membership_results = await asyncio.gather(*(check_membership(c) for c in available))
+    
+    actually_available = []
+    channels_to_add = []
+    for selected_channel, in_chat in membership_results:
+        if in_chat:
+            channels_to_add.append(selected_channel["channel_id"])
+        else:
+            actually_available.append(selected_channel)
+            
+    if channels_to_add:
+        await asyncio.gather(*(add_user_channel(user_id, cid) for cid in channels_to_add))
+        
+    available = actually_available
+    
+    selected = None
+    if available:
+        random.shuffle(available)
+        for s in available:
+            try:
+                await context.bot.decline_chat_join_request(chat_id=s["channel_id"], user_id=user_id)
+                selected = s
+                break
+            except Exception as e:
+                if "already a participant" in str(e).lower():
+                    await add_user_channel(user_id, s["channel_id"])
+                else:
+                    selected = s
+                    break
 
     # If all channels were skipped because user is already in them
-    if not available:
+    if not selected:
         log.info(f"No available channels for {user_id} after checking membership. Delivering directly.")
-        msg = await update.message.reply_text("⏳ Sending your files...")
-        sent_messages = []
         protect_status = await get_protect_content()
-        for f in files_list:
-            try:
-                if f["type"] == "document":
-                    s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
-                elif f["type"] == "video":
-                    s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
-                elif f["type"] == "photo":
-                    s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
-                elif f["type"] == "text":
-                    s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
-                sent_messages.append(s_msg.message_id)
-            except Exception as e:
-                log.error(f"Send error: {e}")
-        await msg.delete()
-        
-        if sent_messages:
-            timer = await get_delete_timer()
-            warning_msg = await context.bot.send_message(
-                chat_id=user_id, 
-                text=f"⚠️ *Important:*\n\nAll Messages will be deleted after {timer} minutes. Please save or forward these messages to your personal saved messages to avoid losing them!",
-                parse_mode="Markdown"
-            )
-            sent_messages.append(warning_msg.message_id)
-            if context.job_queue:
-                context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
-            else:
-                log.warning("No JobQueue available. Messages will not be auto-deleted.")
-        
+        asyncio.create_task(_deliver_files_background(context.bot, context.job_queue, user_id, files_list, protect_status))
         return
 
-    # Generate a FRESH invite link to bypass Telegram's client-side cache
-    try:
-        fresh_invite = await context.bot.create_chat_invite_link(
-            chat_id=selected["channel_id"],
-            creates_join_request=True
-        )
-        invite_url = fresh_invite.invite_link
-    except Exception:
-        invite_url = selected["invite_link"]  # Fallback to stored link
+    # Use stored invite link instead of generating a fresh one
+    invite_url = selected["invite_link"]
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Channel to Access", url=invite_url)]
@@ -740,42 +723,11 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if pending_payload:
         files_list = await get_file(pending_payload)
         log.info(f"Files found in DB: {len(files_list) if files_list else 0}")
-        sent_messages = []
         if files_list:
             protect_status = await get_protect_content()
-            for f in files_list:
-                try:
-                    if f["type"] == "document":
-                        s_msg = await context.bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
-                    elif f["type"] == "video":
-                        s_msg = await context.bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
-                    elif f["type"] == "photo":
-                        s_msg = await context.bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
-                    elif f["type"] == "text":
-                        s_msg = await context.bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
-                    sent_messages.append(s_msg.message_id)
-                except Exception as e:
-                    log.error(f"Failed to send to {user_id}: {e}")
+            asyncio.create_task(_deliver_files_background(context.bot, context.job_queue, user_id, files_list, protect_status, msg_id))
+            
         await clear_pending(user_id)
-        
-        if msg_id:
-            try:
-                await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception as e:
-                log.error(f"Failed to delete join request message: {e}")
-
-        if sent_messages:
-            timer = await get_delete_timer()
-            warning_msg = await context.bot.send_message(
-                chat_id=user_id, 
-                text=f"⚠️ *Important:*\n\nAll Messages will be deleted after {timer} minutes. Please save or forward these messages to your personal saved messages to avoid losing them!",
-                parse_mode="Markdown"
-            )
-            sent_messages.append(warning_msg.message_id)
-            if context.job_queue:
-                context.job_queue.run_once(delete_messages_job, timer * 60, data={"chat_id": user_id, "message_ids": sent_messages})
-            else:
-                log.warning("No JobQueue available. Messages will not be auto-deleted.")
 
     # NOTE: We do NOT call request.approve(). The join request stays pending.
 

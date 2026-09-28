@@ -3,10 +3,12 @@ import random
 import string
 import logging
 import asyncio
+import time
 from dotenv import load_dotenv
 from keep_alive import keep_alive
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ChatJoinRequestHandler, ContextTypes, filters, CallbackQueryHandler
@@ -124,9 +126,48 @@ async def clear_pending(user_id):
 
 
 # ==========================================
-# In-memory batch state tracker
+# In-memory batch state tracker & channel locks
 # ==========================================
 batch_state = {}
+_channel_locks = {}
+_channel_last_send = {}
+
+def get_channel_lock(channel_id: int) -> asyncio.Lock:
+    if channel_id not in _channel_locks:
+        _channel_locks[channel_id] = asyncio.Lock()
+    return _channel_locks[channel_id]
+
+async def send_post_to_db_channel(bot, db_id: int, thumb_bytes: bytes, caption: str, max_retries: int = 5) -> bool:
+    """
+    Safely sends a poster to a DB channel.
+    Adheres to Telegram's 20 msgs/min rate limit by enforcing at least 3.2s pacing per channel
+    and intercepts RetryAfter to wait out any FloodWait cooldown rather than dropping messages.
+    """
+    lock = get_channel_lock(db_id)
+    async with lock:
+        now = time.monotonic()
+        last_send = _channel_last_send.get(db_id, 0)
+        elapsed = now - last_send
+        min_interval = 3.2  # 60s / 20 = 3s per message max for channels/groups
+        if elapsed < min_interval:
+            await asyncio.sleep(min_interval - elapsed)
+
+        for attempt in range(max_retries):
+            try:
+                if thumb_bytes:
+                    await bot.send_photo(chat_id=db_id, photo=thumb_bytes, caption=caption, parse_mode="Markdown")
+                else:
+                    await bot.send_message(chat_id=db_id, text=f"No thumbnail available.\n\n{caption}", parse_mode="Markdown")
+                _channel_last_send[db_id] = time.monotonic()
+                return True
+            except RetryAfter as e:
+                wait_time = float(e.retry_after) + 1.5
+                log.warning(f"Flood control exceeded for channel {db_id}. Waiting {wait_time:.1f}s before retry (attempt {attempt+1}/{max_retries})...")
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                log.error(f"Failed to send poster to db channel {db_id}: {e}")
+                return False
+        return False
 
 async def delete_messages_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -148,20 +189,29 @@ async def _deliver_files_background(bot, job_queue, user_id, files_list, protect
 
     sent_messages = []
     for f in files_list:
-        try:
-            s_msg = None
-            if f["type"] == "document":
-                s_msg = await bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
-            elif f["type"] == "video":
-                s_msg = await bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
-            elif f["type"] == "photo":
-                s_msg = await bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
-            elif f["type"] == "text":
-                s_msg = await bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
-            if s_msg:
-                sent_messages.append(s_msg.message_id)
-        except Exception as e:
-            log.error(f"Send error in background: {e}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                s_msg = None
+                if f["type"] == "document":
+                    s_msg = await bot.send_document(chat_id=user_id, document=f["file_id"], protect_content=protect_status)
+                elif f["type"] == "video":
+                    s_msg = await bot.send_video(chat_id=user_id, video=f["file_id"], protect_content=protect_status)
+                elif f["type"] == "photo":
+                    s_msg = await bot.send_photo(chat_id=user_id, photo=f["file_id"], protect_content=protect_status)
+                elif f["type"] == "text":
+                    s_msg = await bot.send_message(chat_id=user_id, text=f["file_id"], protect_content=protect_status)
+                if s_msg:
+                    sent_messages.append(s_msg.message_id)
+                await asyncio.sleep(0.3)
+                break
+            except RetryAfter as e:
+                wait_time = float(e.retry_after) + 1.0
+                log.warning(f"Flood control exceeded sending file to user {user_id}. Waiting {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                log.error(f"Send error in background: {e}")
+                break
             
     if sent_messages:
         timer = await get_delete_timer()
@@ -452,25 +502,33 @@ async def _run_broadcast_background(bot, chat_id, msg_to_broadcast, users, statu
     
     for i, u in enumerate(users):
         user_id = u["user_id"]
-        try:
-            if msg_to_broadcast.forward_origin:
-                await bot.forward_message(
-                    chat_id=user_id,
-                    from_chat_id=chat_id,
-                    message_id=msg_to_broadcast.message_id
-                )
-            else:
-                await bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=chat_id,
-                    message_id=msg_to_broadcast.message_id
-                )
-            success += 1
-        except Exception as e:
-            if "Forbidden" in str(e) or "bot was blocked" in str(e) or "user is deactivated" in str(e):
-                await users_col.delete_one({"user_id": user_id})
-                deleted += 1
-            failed += 1
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if msg_to_broadcast.forward_origin:
+                    await bot.forward_message(
+                        chat_id=user_id,
+                        from_chat_id=chat_id,
+                        message_id=msg_to_broadcast.message_id
+                    )
+                else:
+                    await bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=chat_id,
+                        message_id=msg_to_broadcast.message_id
+                    )
+                success += 1
+                break
+            except RetryAfter as e:
+                wait_time = float(e.retry_after) + 1.0
+                log.warning(f"Broadcast hit flood limit. Waiting {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                if "Forbidden" in str(e) or "bot was blocked" in str(e) or "user is deactivated" in str(e):
+                    await users_col.delete_one({"user_id": user_id})
+                    deleted += 1
+                failed += 1
+                break
             
         # Update progress every 20 users
         if (i + 1) % 20 == 0:
@@ -930,15 +988,11 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         
                     caption = f"{chosen_text}\n\n🔗 [Click here to Watch/Download]({deep_link})\n\n{orig_caption}"
                     
-                    # Post to DB processing channels
+                    # Post to DB processing channels safely with rate limiting
                     for db_id in db_channels:
-                        try:
-                            if thumb_bytes:
-                                await context.bot.send_photo(chat_id=db_id, photo=thumb_bytes, caption=caption, parse_mode="Markdown")
-                            else:
-                                await context.bot.send_message(chat_id=db_id, text=f"No thumbnail available.\n\n{caption}", parse_mode="Markdown")
-                        except Exception as e:
-                            log.error(f"Failed to send poster to db channel {db_id}: {e}")
+                        ok = await send_post_to_db_channel(context.bot, db_id, thumb_bytes, caption)
+                        if not ok:
+                            log.error(f"Failed to send poster to db channel {db_id}")
                             
                     processed_count += 1
                     
@@ -990,14 +1044,13 @@ async def live_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     orig_caption = msg.caption or ''
     caption = f"{chosen_text}\n\n🔗 [Click here to Watch/Download]({deep_link})\n\n{orig_caption}"
         
-    for db_id in db_channels:
-        try:
-            if thumb_bytes:
-                await context.bot.send_photo(chat_id=db_id, photo=thumb_bytes, caption=caption, parse_mode="Markdown")
-            else:
-                await context.bot.send_message(chat_id=db_id, text=f"No thumbnail available.\n\n{caption}", parse_mode="Markdown")
-        except Exception as e:
-            log.error(f"Live broadcast send error to {db_id}: {e}")
+    async def _broadcast_live_post(db_ids, tb_bytes, cap):
+        for d_id in db_ids:
+            ok = await send_post_to_db_channel(context.bot, d_id, tb_bytes, cap)
+            if not ok:
+                log.error(f"Live broadcast failed to send to {d_id}")
+
+    asyncio.create_task(_broadcast_live_post(db_channels, thumb_bytes, caption))
 
 # ==========================================
 # MAIN
